@@ -1,0 +1,81 @@
+#
+# sfa_health.conf -  Configuration file for sfa_health
+#
+[DEFAULT]
+
+#----------------------------------------------------------------------------
+# Control Flags
+#----------------------------------------------------------------------------
+
+# Enable debugging output [true|false]
+#debug: true
+
+# Log to SYSLOG [true|false]
+#syslog: true
+
+# Turn off STDOUT output [true|false]
+#no_stdout: true
+
+
+
+#----------------------------------------------------------------------------
+# Report configurations
+#----------------------------------------------------------------------------
+
+# Directory where reports should be saved
+#report_dir: /path/to/report/dir
+
+# Generate a short report [true|false]
+#short_report: true
+
+# Number of days to keep reports
+#keep_days: 30
+
+
+#----------------------------------------------------------------------------
+# Email Configurations
+#----------------------------------------------------------------------------
+
+# Mail server
+#mail_server: your.mail.server
+
+# CSV list of recipients
+# recipients: user1@localdomain,user2@localdomain
+
+# Who replies to the report should be sent to
+# reply_to: replyto@localdomain
+
+# Extra text to be added to the subject line
+#subject_extra: Testing
+
+# Only send email on non-healthy reports [true|false]
+#no_email_healthy: true
+
+
+
+#----------------------------------------------------------------------------
+# Controller configurations
+#----------------------------------------------------------------------------
+
+# CSV list of controllers to check
+# The list can be hostnames, fqdn, or IP addresses
+#controllers: controller1,controller2
+
+# Default credentials for all controllers
+#username = <username>
+#password = changeme
+
+
+
+
+#===========================================================================
+# Sections for controller specific values
+#===========================================================================
+#[controller1]
+#username = user1
+#password = pass1
+
+#[controller2]
+#username = user2
+#password = pass2
+

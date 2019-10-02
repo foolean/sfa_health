@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+#
+#   Filename:   sfa_health
+#   Author:     Bennett Samowich <bennett.samowich@nasa.gov>
+#   Date:       2019-08-06
+#
+#   Description:
+#       This script checks multiple SFA's and its components for
+#       indications of unhealthy states.
+#
+#   External Dependencies:
+#       This script requires the DDN SFA API. which must be obtained
+#       through your DDN support contract (https://www.ddn.com/)
+#
+#           * DDN_SFA_API >= 11.5.0
+#
+###############################################################################
+#
+# Copyright 2019 Bennett Samowich <bennett@foolean.org>
+#
+# sfa_health is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# sfa_health is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with sfa_health.  If not, see <http://www.gnu.org/licenses/>.
+#
+###############################################################################
+'''
+DDN SFA Health Reporting tool
+
+sfa_health is adapted from DDN's sfa_monitoring.py script.  It leverages
+DDN's API to gather the health status of multiple aspects of a DDN storage
+device.
+'''
+
+# Import standard libraries
+from collections import OrderedDict
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import argparse
+import configparser
+import datetime
+import getpass
+import os
+import signal
+import smtplib
+import socket
+import sys
+import time
+import syslog
+from tabulate import tabulate
+
+# Import third-party libraries
+from ddn.sfa.api import \
+    APIConnect, APIDisconnect, APIException, \
+    SFAController, SFADiskDrive, SFADiskSlot, \
+    SFAEnclosure, SFAExpander, SFAFan, \
+    SFAICLChannel, SFAICLIOC, SFAInternalDiskDrive, \
+    SFAIOC, SFAJob, SFAPowerSupply, SFASEP, \
+    SFAStorageSystem, SFAStoragePool, SFATemperatureSensor, SFAUPS, \
+    SFAVirtualDisk, SFAVoltageSensor
+
+# Module constants
+__author__ = 'Bennett Samowich <bennett.samowich@nasa.gov>'
+__version__ = '1.0.0'
+
+# Placeholders for command-line and configuration file options
+OPTIONS = {}
+
+# Lockfile
+LOCKFILE = '/var/lock/sfa_health.lock'
+
+# Default configuration file
+DEFAULT_CONFIG_FILE = '/usr/local/etc/sfa_health.conf'
+
+# Default days to prune the reports directory to
+DEFAULT_KEEP_DAYS = 30
+
+
+def email_sfa_health_report(issues, report, recipients, server='', subject_addon=''):
+    '''
+    Send the SFA health report via email to a list of recipients
+    '''
+
+    # Indicate if the report is Full or Short
+    report_type = 'Full'
+    if OPTIONS['short_report'] is True:
+        report_type = 'Short'
+
+    # Assemble the subject line
+    if issues == 1:
+        subject = 'SFA Health %s Report - %s issue found' % (report_type, issues)
+    else:
+        subject = 'SFA Health %s Report - %s issues found' % (report_type, issues)
+
+    # Add any additional subject content
+    if subject_addon != '' and subject_addon is not None:
+        subject += " (%s)" % (subject_addon)
+
+    # Assemble the sender address (user@fqdn)
+    sender = '%s@%s' % (getpass.getuser(), socket.getfqdn())
+
+    # Assemble the email
+    notice('Sending report to "%s"' % (', '.join(recipients)))
+    msg = MIMEMultipart()
+    msg['From'] = sender
+    msg['To'] = ', '.join(recipients)
+    if 'reply_to' in OPTIONS:
+        msg['Reply-To'] = OPTIONS['reply_to']
+    msg['Subject'] = subject
+    msg.attach(MIMEText(report))
+
+    # Send the message
+    debug('Sending message via "%s"' % (server))
+    smtp = smtplib.SMTP(server, 25)
+    smtp.sendmail(sender, recipients, msg.as_string())
+    smtp.close()
+
+    return
+
+
+def write_sfa_health_report(report, report_dir):
+    '''
+    Write the SFA health report in the specified directory
+    '''
+    report_type = 'long'
+    if OPTIONS['short_report'] is True:
+        report_type = 'short'
+    file_name = '%s/sfa_health_report_%s_%s.txt' % \
+        (report_dir, report_type, datetime.datetime.now().strftime('%Y%m%d%H%M'))
+
+    latest_name = '%s/sfa_health_report_%s_latest.txt' % (report_dir, report_type)
+
+    # See if the file already exists
+    if os.path.isfile(file_name):
+        notice(file_name + ' already exists, skipping')
+        return
+
+    # Open the report file
+    notice('Saving report to "%s"' % (file_name))
+    try:
+        handle = open(file_name, 'w')
+    except OSError as err:
+        fatal('unable to open "%s": %s' % (file_name, err))
+
+    # Write the report
+    handle.write(report)
+
+    # Close the report file
+    handle.close()
+
+    # Symlink the report to "latest"
+    debug('Symlinking %s to %s' % (file_name, latest_name))
+    if os.path.islink(latest_name):
+        os.unlink(latest_name)
+    os.symlink(file_name, latest_name)
+
+    # Clean the report directory
+    clean_report_dir(report_dir, OPTIONS['keep_days'])
+
+    return
+
+
+def clean_report_dir(report_dir, days=DEFAULT_KEEP_DAYS):
+    '''
+    Clean report older than a specified number of days
+    '''
+    # Ensure days is a number
+    try:
+        days = int(days)
+    except ValueError:
+        error('invalid days to keep reports: "%s", not cleaning' % (days))
+        return
+
+    debug('Cleaning %s to %s days' % (report_dir, days))
+
+    prune_filter = 'sfa_health_report'
+    prune_time = time.time() - (int(days) * 86400)
+
+    # Walk the report directory...
+    for entry in os.listdir(report_dir):
+        full_path = os.path.join(report_dir, entry)
+        # ... looking for our reports
+        if entry.startswith(prune_filter) and os.path.isfile(full_path):
+            # ... and remove any that are older than {days}
+            if os.stat(full_path).st_ctime < prune_time:
+                ctime = time.ctime(os.stat(full_path).st_ctime)
+                debug('cleaning %s (created on %s)' % (full_path, ctime))
+                os.remove(full_path)
+
+    return
+
+
+def check_component(unhealthy, component_type, health_data):
+    '''
+    Check the health of SFA component
+    '''
+
+    # Collect the information on the desired components
+    if component_type == 'Controller':
+        debug('checking for non-healthy controller')
+        ddn_sfa_api = SFAController.getAll
+    elif component_type == 'Expander':
+        debug('checking for non-healthy expanders')
+        ddn_sfa_api = SFAExpander.getAll
+    elif component_type == 'Fan':
+        debug('checking for non-healthy fans')
+        ddn_sfa_api = SFAFan.getAll
+    elif component_type == 'Enclosure':
+        debug('checking for non-healthy enclosures')
+        ddn_sfa_api = SFAEnclosure.getAll
+    elif component_type == 'ICL Channel':
+        debug('checking for non-healthy channels')
+        ddn_sfa_api = SFAICLChannel.getAll
+    elif component_type == 'ICL IOC':
+        debug('checking for ICL IOC failures')
+        ddn_sfa_api = SFAICLIOC.getAll
+    elif component_type == 'IOC':
+        debug('checking for non-healthy IOCs')
+        ddn_sfa_api = SFAIOC.getAll
+    elif component_type == 'Internal Disk':
+        debug('checking for failed internal disks')
+        ddn_sfa_api = SFAInternalDiskDrive.getAll
+    elif component_type == 'Job':
+        debug('checking for failed jobs')
+        ddn_sfa_api = SFAJob.getAll
+    elif component_type == 'Power Supply':
+        debug('checking for non-healthy power supplies')
+        ddn_sfa_api = SFAPowerSupply.getAll
+    elif component_type == 'Sep':
+        debug('checking for non-healthy sep')
+        ddn_sfa_api = SFASEP.getAll
+    elif component_type == 'Slot':
+        debug('checking for non-healthy slots')
+        ddn_sfa_api = SFADiskSlot.getAll
+    elif component_type == 'Temperature':
+        debug('checking for temperature failures')
+        ddn_sfa_api = SFATemperatureSensor.getAll
+    elif component_type == 'Ups':
+        debug('checking for non-healthy UPSs')
+        ddn_sfa_api = SFAUPS.getAll
+    elif component_type == 'Virtual Disk':
+        debug('checking for non-healthy vds')
+        ddn_sfa_api = SFAVirtualDisk.getAll
+    elif component_type == 'Voltage Sensor':
+        debug('checking for voltage sensor failures')
+        ddn_sfa_api = SFAVoltageSensor.getAll
+    elif component_type == 'Physical Disk':
+        debug('checking for failed drives')
+        ddn_sfa_api = SFADiskDrive.getAll
+    elif component_type == 'Storage Pool':
+        debug('checking for non-healthy pools')
+        ddn_sfa_api = SFAStoragePool.getAll
+    else:
+        error('Unknown component type "%s"' % (component_type))
+        return
+
+    # Call the DDN API
+    try:
+        components = ddn_sfa_api()
+        for component in components:
+            # Get the name, if there is one
+            try:
+                name = component.Name
+            except AttributeError:
+                name = ' '
+
+            # The health state and status are different for Jobs
+            if component_type == 'Job':
+                health_state = component.State
+                health_state_str = component.State.str()
+            else:
+                health_state = component.HealthState
+                health_state_str = component.HealthState.str()
+
+            # Add the health data to the report if we're not OK or we're creating long report
+            if (health_state != 1) or (OPTIONS['short_report'] is False):
+                health_data.append(OrderedDict([('Component', component_type), ('Name', name), ('Index', '%s' % (component.Index)), ('Health State', '%s' % (health_state_str))]))
+
+            # Increment the unhealthy count if we're not OK
+            if health_state != 1:
+                unhealthy += 1
+
+    except Exception as e:
+        error('Unable to check %s: %s' % (component_type, e))
+        health_data.append(OrderedDict([('Component', component_type), ('Name', 'UNKNOWN'), ('Index', 'UNKNOWN'), ('Health State', e)]))
+        unhealthy += 1
+    except:
+        error('Unable to check %s' % (component_type))
+        health_data.append(OrderedDict([('Component', component_type), ('Name', 'UNKNOWN'), ('Index', 'UNKNOWN'), ('Health State', 'UNKNOWN')]))
+        unhealthy += 1
+
+    # Return the new unhealthy count and report
+    return unhealthy, health_data
+
+
+def get_sfa_health_report(report):
+    '''
+    Generate a health report for all specified controllers
+    '''
+    unhealthy_count = 0
+
+    # Iterate over the controllers
+    for controller in OPTIONS['controllers']:
+
+        # Obtain and default or per-controller options
+        if OPTIONS['config'].has_section(controller):
+            controller_data = dict(OPTIONS['config'].items(controller))
+        else:
+            controller_data = dict(OPTIONS['config'].items('DEFAULT'))
+
+        # Cover the case where credentials were not provided
+        if 'username' not in controller_data:
+            controller_data['username'] = None
+        if 'password' not in controller_data:
+            controller_data['password'] = None
+
+        # Resolve the IP address of the controller
+        # (The DDN API requires IP addresses and will not work with hostnames or FQDNs)
+        ip_address = socket.gethostbyname(controller)
+        try:
+            # set up API context
+            APIConnect("https://" + ip_address, auth=(controller_data['username'], controller_data['password']))
+            system = SFAStorageSystem.get()
+            if system.Name == "":
+                system.Name = '<<unknown>>'
+            report += "-----------------------------------------------------------\n"
+            report += " Connected to %s (%s)'\n" % (controller, ip_address)
+            report += "\n\t * System Name: %s *\n" % (system.Name)
+            report += "\t * System IP:   %s *\n\n" % (ip_address)
+        except APIException:
+            error('Unable to connect to %s (%s)' % (controller, ip_address))
+            unhealthy_count += 1
+            report += " Unable to connect to %s (%s)'\n\n" % (controller, ip_address)
+        else:
+            notice('Checking "%s" (%s)' % (system.Name, ip_address))
+
+            # need to create array for keep the data of components
+            health_check = []
+
+            # Check the individual components
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Controller', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Expander', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Fan', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Enclosure', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'ICL Channel', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'ICL IOC', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'IOC', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Internal Disk', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Job', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Power Supply', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Sep', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Slot', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Temperature', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Ups', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Virtual Disk', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Voltage Sensor', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Physical Disk', health_check)
+            unhealthy_count, health_check = check_component(unhealthy_count, 'Storage Pool', health_check)
+
+            # Add the summary of issues found
+            if unhealthy_count == 0:
+                report += "\n SUMMARY: No Issues Found. System(s) State Is Healthy.\n"
+            elif unhealthy_count == 1:
+                report += "\n SUMMARY: %s Issue Found. System(s) State Is Unhealthy.\n" % (unhealthy_count)
+            else:
+                report += "\n SUMMARY: %s Issues Found. System(s) State Is Unhealthy.\n" % (unhealthy_count)
+
+            # create table format for health states
+            report += tabulate(health_check, headers="keys", tablefmt="orgtbl")
+            report += "\n-----------------------------------------------------------\n\n\n"
+
+            # Disconnect API Context
+            APIDisconnect()
+
+
+    if unhealthy_count == 1:
+        notice('Result: %s health issue found' % (unhealthy_count))
+    else:
+        notice('Result: %s health issues found' % (unhealthy_count))
+
+    return(unhealthy_count, report)
+
+
+def parse_arguments():
+    '''
+    Parse the command-line arguments
+    '''
+    parser = argparse.ArgumentParser(description='Check SFA system for failed components')
+
+    group = parser.add_argument_group('General control options')
+
+    group.add_argument(
+        '-C', '--config',
+        dest='config_file',
+        default=DEFAULT_CONFIG_FILE,
+        help='Specify an alternate configuration file [default: %(default)s]'
+    )
+
+    group.add_argument(
+        '-d', '--debug',
+        dest='debug',
+        action='store_true',
+        help='Print debugging messages',
+    )
+
+    group.add_argument(
+        '-l', '--syslog',
+        dest='syslog',
+        action='store_true',
+        help='Log progress to syslog',
+    )
+
+    group.add_argument(
+        '-t', '--timestamp',
+        dest='timestamp',
+        action='store_true',
+        help='Add timestamp to notification messages',
+    )
+
+    group.add_argument(
+        '--no-stdout',
+        dest='no_stdout',
+        action='store_true',
+        help='Do not print the report to stdout',
+    )
+
+
+    controller_group = parser.add_argument_group('Controller options')
+
+    controller_group.add_argument(
+        '-c', '--controller',
+        dest='controllers',
+        action='append',
+        help='Specify a SFA controller (use multiple times for multiple controllers',
+    )
+
+    email_group = parser.add_argument_group('Email control options')
+
+    email_group.add_argument(
+        '-e', '--recipient',
+        dest='email_recipients',
+        action='append',
+        help='Specify email recipient (use multiple times for multiple recipients)',
+    )
+
+    email_group.add_argument(
+        '--reply-to',
+        dest='reply_to',
+        help='Specify where replies should be sent'
+    )
+
+    email_group.add_argument(
+        '-m', '--mail-server',
+        dest='mail_server',
+        help='Specify mail server for sending reports',
+    )
+
+    email_group.add_argument(
+        '--subject-extra',
+        dest='subject_extra',
+        help='Extra text to include in the subject line (useful for marking test reports)'
+    )
+
+    email_group.add_argument(
+        '--no-email-healthy',
+        dest='no_email_healthy',
+        action='store_true',
+        help='Do not email reports when the system is healthy',
+    )
+
+
+    report_group = parser.add_argument_group('Report control options')
+
+    report_group.add_argument(
+        '-k', '--keep-days',
+        dest='keep_days',
+        help='Number of days to keep reports',
+    )
+
+    report_group.add_argument(
+        '-r', '--report-dir',
+        dest='report_dir',
+        help='Specify the directory in which to write the reports to',
+    )
+
+    report_group.add_argument(
+        '-s', '--short-report',
+        dest='short_report',
+        action='store_true',
+        help='Report non-healthy elements only',
+    )
+
+    # Parse the command-line arguments
+    args = parser.parse_args()
+    OPTIONS.update(vars(args))
+
+    # Make sure the report directory exists
+    if OPTIONS['report_dir'] != '' and OPTIONS['report_dir'] is not None:
+        if not os.path.isdir(OPTIONS['report_dir']):
+            fatal('Report directory "%s" does not exist, aborting' % (OPTIONS['report_dir']))
+
+    ## Sanity check on email settings
+    #OPTIONS['email_report'] = True
+    #if OPTIONS['mail_server'] == '' or OPTIONS['mail_server'] is None:
+    #    debug('No email server specified, disabling emailing of report')
+    #    OPTIONS['email_report'] = False
+
+    #if OPTIONS['email_recipients'] is None and OPTIONS['email_report'] is True:
+    #    debug('No email recipients specified, disabling emailing of report')
+    #    OPTIONS['email_report'] = False
+
+    ## There's no sense in running if we won't be sending the output anywhere
+    #if OPTIONS['report_dir'] == '' and OPTIONS['email_report'] is False and OPTIONS['no_stdout'] is True:
+    #    fatal('No output destinations specified, aborting')
+
+    return
+
+
+def load_configuration_file():
+    '''
+    Load and parse the configuration file
+    '''
+    config_data = {}
+
+    config = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        with open(OPTIONS['config_file']) as handle:
+            config.read_string(handle.read())
+            handle.close()
+    except OSError as err:
+        fatal('unable to open "%s": %s' %(OPTIONS['config_file'], err))
+        clean_exit(1) # should never get here
+
+    # Convert the config object into a dictionary
+    for (var, val) in config.items('DEFAULT'):
+        config_data[var] = val
+
+    # Set the array of controllers
+    if config.has_option('DEFAULT', 'controllers'):
+        config_data['controllers'] = config['DEFAULT']['controllers'].split(',')
+
+    # Set the array of recipients
+    if config.has_option('DEFAULT', 'recipients'):
+        config_data['email_recipients'] = config['DEFAULT']['recipients'].split(',')
+
+    # Set any boolean values from the config
+    config_data['short_report'] = config['DEFAULT'].getboolean('short_report', False)
+    config_data['syslog'] = config['DEFAULT'].getboolean('syslog', False)
+    config_data['debug'] = config['DEFAULT'].getboolean('debug', False)
+    config_data['no_email_healthy'] = config['DEFAULT'].getboolean('no_email_healthy', False)
+    config_data['no_stdout'] = config['DEFAULT'].getboolean('no_stdout', False)
+
+    # Unspecified booleans default to False on the command-line and
+    # will override any True values in the config.  We'll handle that
+    # now by resetting them to the desired values
+    if OPTIONS['short_report'] is False:
+        OPTIONS['short_report'] = config_data['short_report']
+    if OPTIONS['debug'] is False:
+        OPTIONS['debug'] = config_data['debug']
+    if OPTIONS['syslog'] is False:
+        OPTIONS['syslog'] = config_data['syslog']
+    if OPTIONS['no_email_healthy'] is False:
+        OPTIONS['no_email_healthy'] = config_data['no_email_healthy']
+    if OPTIONS['no_stdout'] is False:
+        OPTIONS['no_stdout'] = config_data['no_stdout']
+
+    # Override the configuration options with the command-line
+    for key in OPTIONS:
+        if OPTIONS[key] is not None:
+            config_data[key] = OPTIONS[key]
+
+    # Copy the resultant configuration options back into the options dictionary
+    for key in config_data:
+        OPTIONS[key] = config_data[key]
+
+    # Sanity check on email settings
+    OPTIONS['email_report'] = True
+    if OPTIONS['mail_server'] == '' or OPTIONS['mail_server'] is None:
+        debug('No email server specified, disabling emailing of report')
+        OPTIONS['email_report'] = False
+
+    if OPTIONS['email_recipients'] is None and OPTIONS['email_report'] is True:
+        debug('No email recipients specified, disabling emailing of report')
+        OPTIONS['email_report'] = False
+
+    # Add the config object to the options dictionary
+    OPTIONS['config'] = config
+
+
+def debug(string):
+    '''
+    Helper function to log/print debugging messages.
+    Messages will be prepended with the tag "debug", which will also
+    include the current thread's identifier.
+    '''
+    if OPTIONS['debug'] is True:
+        logprint('debug: %s' % (string))
+    return
+
+
+def error(string):
+    '''
+    Helper function to log/print non-fatal error messages and exit.
+    Messages will be prepended with the tag "error", which will also
+    include the current thread's identifier.
+    '''
+    logprint('error: %s' % (string))
+    return
+
+
+def fatal(string):
+    '''
+    Helper function to log/print fatal error messages and exit.
+    Messages will be prepended with the tag "fatal", which will also
+    include the current thread's identifier.
+    '''
+    logprint('fatal: %s' % (string))
+    clean_exit(1)
+
+
+def notice(string):
+    '''
+    Helper function to log/print general notice messages.
+    Messages will be prepended with the tag "notice", which will also
+    include the current thread's identifier.
+    '''
+    logprint('notice: %s' % (string))
+    return
+
+
+def warning(string):
+    '''
+    Helper function to log/print warning messages.
+    Messages will be prepended with the tag "warning", which will also
+    include the current thread's identifier.
+    '''
+    logprint('warning(%s): %s' % (string))
+    return
+
+
+def logprint(string):
+    '''
+    Helper function to log and print messages.  Generally
+    this will be called by higher-level functions such as
+    debug, error, fatal, notice, and warning.
+    '''
+
+    if OPTIONS['syslog'] is True:
+        syslog.syslog(string)
+
+    if OPTIONS['timestamp'] is True:
+        stamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+        print('[%s]: %s' % (stamp, string))
+    else:
+        print(string)
+
+    return
+
+
+def signal_handler(signalnum, frame):
+    '''
+    Helper function to exit cleanly when SIGINT is caught
+    '''
+    del frame
+
+    # Create a list of signal names so we can convert
+    # the incoming signal number to it's readable name.
+    # (doing it this way is more portable)
+    #sig_items = reversed(sorted(signal.__dict__.items()))
+    signals = dict((k, v) for v, k in reversed(sorted(signal.__dict__.items())) if v.startswith('SIG') and not v.startswith('SIG_'))
+
+    notice('caught signal "%s"' % (signals[signalnum]))
+
+    clean_exit(0)
+
+
+def clean_exit(exit_code):
+    '''
+    Helper function to perform cleanup prior to exiting
+    '''
+    # Remove the lock file
+    if os.path.exists(LOCKFILE):
+        debug('Removing %s' % (LOCKFILE))
+        try:
+            os.remove(LOCKFILE)
+        except OSError as err:
+            fatal('unable to remove "%s": %s' % (LOCKFILE, err))
+
+    # Exit with our desired exit code
+    sys.exit(exit_code)
+
+
+def main():
+    '''
+    Main processing function
+    '''
+
+    # Catch SIGINT
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Start SYSLOG logging
+    syslog.openlog(os.path.basename(sys.argv[0]), logoption=syslog.LOG_PID)
+
+    # Load our command-line and configuration file options
+    parse_arguments()
+    load_configuration_file()
+
+    # Set the report's header
+    health_report = "\n* Generated on %s at %s \n" % (socket.gethostname(), datetime.datetime.now())
+    health_report += "-----------------------------------------------------------\n"
+    health_report += "                  SFA HEALTH MONITOR                       \n"
+    health_report += "-----------------------------------------------------------\n\n"
+
+    # Make sure we're not already running
+    if os.path.exists(LOCKFILE):
+        error('another sfa_health process is already running')
+        # Send an email notification, if we can, so stale lockfiles are caught
+        if OPTIONS['email_report'] is True:
+            unhealthy_count = 1
+            health_report += "\n\nnAnother sfa_health process is already running or there is a stale lockfile\n"
+            health_report += "\nCheck for hung process or stale lockfile (%s)\n" % (LOCKFILE)
+            email_sfa_health_report(unhealthy_count, health_report, OPTIONS['email_recipients'], OPTIONS['mail_server'], OPTIONS['subject_extra'])
+        sys.exit(1)
+
+    # Touch the lock file to prevent multiple invocations
+    debug('Creating lockfile "%s"' % (LOCKFILE))
+    open(LOCKFILE, 'a').close()
+
+    notice('Starting')
+
+    # Get the SFA health report
+    unhealthy_count, health_report = get_sfa_health_report(health_report)
+
+    # Write the SFA health report to the output file
+    if OPTIONS['report_dir'] == '' or OPTIONS['report_dir'] is None:
+        notice('No report directory specified, skipping saved report')
+    else:
+        write_sfa_health_report(health_report, OPTIONS['report_dir'])
+
+    # Email the report
+    if OPTIONS['no_email_healthy'] is True and unhealthy_count == 0:
+        notice('System is healthy and --no-email-healthy set, skipping email report')
+    else:
+        if OPTIONS['email_report'] is True:
+            email_sfa_health_report(unhealthy_count, health_report, OPTIONS['email_recipients'], OPTIONS['mail_server'], OPTIONS['subject_extra'])
+        else:
+            notice('Email report disabled, skipping')
+
+    # Print the SFA health report to the screen
+    if OPTIONS['no_stdout'] is False:
+        print(health_report)
+
+    notice('Finished')
+    clean_exit(0)
+
+
+# Allow other programs to source this one as a library
+if __name__ == '__main__':
+    try:
+        main()
+    finally:
+        sys.exit(0)
