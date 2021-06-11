@@ -75,7 +75,7 @@ __version__ = '1.0.0'
 OPTIONS = {}
 
 # Lockfile
-LOCKFILE = '/var/lock/sfa_health.lock'
+DEFAULT_LOCKFILE = '/var/lock/sfa_health.lock'
 
 # Default configuration file
 DEFAULT_CONFIG_FILE = '/usr/local/etc/sfa_health.conf'
@@ -432,6 +432,12 @@ def parse_arguments():
         help='Do not print the report to stdout',
     )
 
+    group.add_argument(
+        '-L', '--lockfile',
+        dest='lockfile',
+        default=DEFAULT_LOCKFILE,
+        help='Specify the lockfile [default: %(default)s]',
+    )
 
     controller_group = parser.add_argument_group('Controller options')
 
@@ -687,12 +693,12 @@ def clean_exit(exit_code):
     Helper function to perform cleanup prior to exiting
     '''
     # Remove the lock file
-    if os.path.exists(LOCKFILE):
-        debug('Removing %s' % (LOCKFILE))
+    if os.path.exists(OPTIONS['lockfile']):
+        debug('Removing %s' % (OPTIONS['lockfile']))
         try:
-            os.remove(LOCKFILE)
+            os.remove(OPTIONS['lockfile'])
         except OSError as err:
-            fatal('unable to remove "%s": %s' % (LOCKFILE, err))
+            fatal('unable to remove "%s": %s' % (OPTIONS['lockfile'], err))
 
     # Exit with our desired exit code
     sys.exit(exit_code)
@@ -720,19 +726,19 @@ def main():
     health_report += "-----------------------------------------------------------\n\n"
 
     # Make sure we're not already running
-    if os.path.exists(LOCKFILE):
+    if os.path.exists(OPTIONS['lockfile']):
         error('another sfa_health process is already running')
         # Send an email notification, if we can, so stale lockfiles are caught
         if OPTIONS['email_report'] is True:
             unhealthy_count = 1
             health_report += "\n\nnAnother sfa_health process is already running or there is a stale lockfile\n"
-            health_report += "\nCheck for hung process or stale lockfile (%s)\n" % (LOCKFILE)
+            health_report += "\nCheck for hung process or stale lockfile (%s)\n" % (OPTIONS['lockfile'])
             email_sfa_health_report(unhealthy_count, health_report, OPTIONS['email_recipients'], OPTIONS['mail_server'], OPTIONS['subject_extra'])
         sys.exit(1)
 
     # Touch the lock file to prevent multiple invocations
-    debug('Creating lockfile "%s"' % (LOCKFILE))
-    open(LOCKFILE, 'a').close()
+    debug('Creating lockfile "%s"' % (OPTIONS['lockfile']))
+    open(OPTIONS['lockfile'], 'a').close()
 
     notice('Starting')
 
