@@ -305,10 +305,11 @@ def get_sfa_health_report(report):
     '''
     Generate a health report for all specified controllers
     '''
-    unhealthy_count = 0
 
     # Iterate over the controllers
     for controller in OPTIONS['controllers']:
+
+        unhealthy_count = 0
 
         # Obtain and default or per-controller options
         if OPTIONS['config'].has_section(controller):
